@@ -103,8 +103,7 @@ namespace DbMetaTool
             if (!Directory.Exists(scriptsDirectory))
                 throw new DirectoryNotFoundException($"Katalog ze skryptami nie istnieje: {scriptsDirectory}");
 
-            // jeśli użytkownik podał już plik .fdb – używamy wprost;
-            // jeśli podał tylko katalog – dokładamy domyślną nazwę
+            // ustalenie ścieżki do pliku bazy
             string dbPath;
             if (Path.HasExtension(databaseDirectory))
             {
@@ -117,22 +116,23 @@ namespace DbMetaTool
                 dbPath = Path.Combine(databaseDirectory, "database.fdb");
             }
 
+            // jeśli istnieje – kasujemy
             if (File.Exists(dbPath))
                 File.Delete(dbPath);
 
-            // 3) Tworzymy connection string i pustą bazę
+            // connection string – embedded + fbclient 32-bit
             var csb = new FbConnectionStringBuilder
             {
                 Database = dbPath,
-                DataSource = "localhost",     // zakładamy lokalny serwer FB
                 UserID = "SYSDBA",
                 Password = "masterkey",
                 Charset = "UTF8",
                 Dialect = 3,
-                Port = 3052
+                ServerType = FbServerType.Embedded,
+                ClientLibrary = @"C:\Program Files (x86)\Firebird\Firebird_5_0_32\fbclient.dll"
             };
 
-            // Tworzymy bazę z typowymi parametrami (pageSize 8192)
+            // tworzenie pustej bazy
             FbConnection.CreateDatabase(
                 csb.ToString(),
                 pageSize: 8192,
@@ -164,6 +164,7 @@ namespace DbMetaTool
                     try
                     {
                         var script = new FbScript(scriptText);
+
                         script.Parse();
 
                         var batch = new FbBatchExecution(connection);
@@ -217,7 +218,7 @@ namespace DbMetaTool
 
                 string domainsSql = GenerateDomainsSql(connection, domainNames);
                 string tablesSql = GenerateTablesSql(connection, domainNames);
-                string proceduresSql = GenerateProceduresSql(connection);
+                string proceduresSql = GenerateProceduresSql(connection, domainNames);
 
                 File.WriteAllText(Path.Combine(outputDirectory, "01_domains.sql"), domainsSql, Encoding.UTF8);
                 File.WriteAllText(Path.Combine(outputDirectory, "02_tables.sql"), tablesSql, Encoding.UTF8);
@@ -234,7 +235,96 @@ namespace DbMetaTool
             // 1) Połącz się z bazą danych przy użyciu connectionString.
             // 2) Wykonaj skrypty z katalogu scriptsDirectory (tylko obsługiwane elementy).
             // 3) Zadbaj o poprawną kolejność i bezpieczeństwo zmian.
-            throw new NotImplementedException();
+            if (string.IsNullOrWhiteSpace(connectionString))
+                throw new ArgumentException("Parametr connectionString jest wymagany.", nameof(connectionString));
+
+            if (string.IsNullOrWhiteSpace(scriptsDirectory))
+                throw new ArgumentException("Parametr scriptsDirectory jest wymagany.", nameof(scriptsDirectory));
+
+            if (!Directory.Exists(scriptsDirectory))
+                throw new DirectoryNotFoundException($"Katalog ze skryptami nie istnieje: {scriptsDirectory}");
+
+            var sqlFiles = Directory
+                .EnumerateFiles(scriptsDirectory, "*.sql")
+                .OrderBy(Path.GetFileName) // np. 01_domains.sql, 02_tables.sql, 03_procedures.sql
+                .ToList();
+
+            if (sqlFiles.Count == 0)
+                throw new InvalidOperationException($"W katalogu {scriptsDirectory} nie znaleziono żadnych plików .sql.");
+
+            var errors = new List<string>();
+
+            using (var connection = new FbConnection(connectionString))
+            {
+                connection.Open();
+
+                foreach (var file in sqlFiles)
+                {
+                    var scriptText = File.ReadAllText(file);
+                    if (string.IsNullOrWhiteSpace(scriptText))
+                        continue;
+
+                    try
+                    {
+                        var script = new FbScript(scriptText);
+                        script.UnknownStatement += (sender, e) =>
+                        {
+                            e.NewStatementType = SqlStatementType.Update;
+                            e.Handled = true;
+                        };
+                        script.Parse();
+
+                        foreach (FbStatement stmt in script.Results)
+                        {
+                            var sql = stmt.Text;
+                            if (string.IsNullOrWhiteSpace(sql))
+                                continue;
+
+                            sql = sql.Trim();
+                            if (string.IsNullOrWhiteSpace(sql))
+                                continue;
+
+                            // 1) jeśli to CREATE DOMAIN i domena już istnieje – pomijamy
+                            if (TryGetCreatedDomainName(sql, out var domainName) &&
+                                DomainExists(connection, domainName))
+                            {
+                                continue;
+                            }
+
+                            using (var cmd = new FbCommand(sql, connection))
+                            {
+                                try
+                                {
+                                    cmd.ExecuteNonQuery();
+                                }
+                                catch (FbException ex)
+                                {
+                                    if (CanIgnoreUpdateError(sql, ex))
+                                        continue;
+
+                                    errors.Add($"Plik '{Path.GetFileName(file)}': {ex.Message}");
+                                }
+                            }
+                        }
+
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Add($"Plik '{Path.GetFileName(file)}': {ex.Message}");
+                    }
+                }
+            }
+
+            if (errors.Count > 0)
+            {
+                Console.WriteLine("Błędy podczas aktualizacji bazy danych:");
+                foreach (var err in errors)
+                {
+                    Console.WriteLine("  - " + err);
+                }
+
+                throw new InvalidOperationException("Aktualizacja bazy zakończona z błędami. Szczegóły powyżej.");
+            }
         }
         #endregion
 
@@ -282,7 +372,7 @@ namespace DbMetaTool
 
                     string typeDef = GetSqlType(fieldType, fieldSubType, fieldScale, fieldPrec, charLen, charSet);
 
-                    sb.Append("CREATE OR ALTER DOMAIN ")
+                    sb.Append("CREATE DOMAIN ")
                       .Append(name)
                       .Append(" AS ")
                       .Append(typeDef);
@@ -421,10 +511,11 @@ namespace DbMetaTool
 
             return result;
         }
-
-        private static string GenerateProceduresSql(FbConnection connection)
+        
+        private static string GenerateProceduresSql(FbConnection connection, HashSet<string> domainNames)
         {
             var sb = new StringBuilder();
+            bool hasAny = false;
 
             const string sql = @"
         SELECT
@@ -439,12 +530,19 @@ namespace DbMetaTool
             {
                 while (reader.Read())
                 {
+                    if (!hasAny)
+                    {
+                        // ustawiamy niestandardowy terminator dla procedur
+                        sb.AppendLine("SET TERM ^ ;");
+                        hasAny = true;
+                    }
+
                     var procName = reader.GetString(reader.GetOrdinal("PROCEDURE_NAME")).Trim();
                     string body = GetNullableString(reader, "SOURCE") ?? string.Empty;
 
                     var inputs = new List<string>();
                     var outputs = new List<string>();
-                    LoadProcedureParameters(connection, procName, inputs, outputs);
+                    LoadProcedureParameters(connection, procName, domainNames, inputs, outputs);
 
                     sb.Append("CREATE OR ALTER PROCEDURE ").Append(procName);
 
@@ -478,47 +576,66 @@ namespace DbMetaTool
                         sb.AppendLine(")");
                     }
 
-                    var trimmedBody = body.TrimEnd();
+                    var trimmedBody = body.Trim();
+                    string bodyToEmit;
 
                     if (string.IsNullOrWhiteSpace(trimmedBody))
                     {
-                        sb.AppendLine("AS")
-                          .AppendLine("BEGIN")
-                          .AppendLine("END");
+                        bodyToEmit = "AS\nBEGIN\nEND";
                     }
                     else
                     {
-                        sb.AppendLine(trimmedBody);
+                        var noLeading = trimmedBody.TrimStart();
+                        if (!noLeading.StartsWith("AS", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // w RDB$PROCEDURE_SOURCE zwykle jest samo BEGIN...END
+                            bodyToEmit = "AS\n" + trimmedBody;
+                        }
+                        else
+                        {
+                            bodyToEmit = trimmedBody;
+                        }
                     }
 
-                    if (!trimmedBody.EndsWith(";"))
-                        sb.AppendLine(";");
+                    // ciało procedury
+                    sb.AppendLine(bodyToEmit.TrimEnd());
 
+                    // terminator procedury – używamy '^'
+                    sb.AppendLine("^");
                     sb.AppendLine();
                 }
+            }
+
+            if (hasAny)
+            {
+                // przywracamy standardowy terminator ';'
+                sb.AppendLine("SET TERM ; ^");
             }
 
             return sb.ToString();
         }
 
+
         private static void LoadProcedureParameters(
             FbConnection connection,
             string procedureName,
+            HashSet<string> domainNames,
             List<string> inputs,
             List<string> outputs)
         {
             const string sql = @"
         SELECT
-            TRIM(pp.RDB$PARAMETER_NAME) AS PARAM_NAME,
-            pp.RDB$PARAMETER_TYPE,
-            pp.RDB$PARAMETER_NUMBER,
-            f.RDB$FIELD_TYPE,
-            f.RDB$FIELD_SUB_TYPE,
-            f.RDB$FIELD_LENGTH,
-            f.RDB$FIELD_PRECISION,
-            f.RDB$FIELD_SCALE,
-            f.RDB$CHARACTER_LENGTH,
-            cs.RDB$CHARACTER_SET_NAME
+    TRIM(pp.RDB$PARAMETER_NAME) AS PARAM_NAME,
+    pp.RDB$PARAMETER_TYPE,
+    pp.RDB$PARAMETER_NUMBER,
+    TRIM(f.RDB$FIELD_NAME)      AS FIELD_SOURCE,
+    f.RDB$FIELD_TYPE,
+    f.RDB$FIELD_SUB_TYPE,
+    f.RDB$FIELD_LENGTH,
+    f.RDB$FIELD_PRECISION,
+    f.RDB$FIELD_SCALE,
+    f.RDB$CHARACTER_LENGTH,
+    cs.RDB$CHARACTER_SET_NAME
         FROM RDB$PROCEDURE_PARAMETERS pp
         JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = pp.RDB$FIELD_SOURCE
         LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
@@ -535,6 +652,7 @@ namespace DbMetaTool
                     {
                         var name = reader.GetString(reader.GetOrdinal("PARAM_NAME")).Trim();
                         short paramType = reader.GetInt16(reader.GetOrdinal("RDB$PARAMETER_TYPE"));
+                        var fieldSrc = reader.GetString(reader.GetOrdinal("FIELD_SOURCE")).Trim();
 
                         short fieldType = reader.GetInt16(reader.GetOrdinal("RDB$FIELD_TYPE"));
                         short? fieldSubType = GetNullableInt16(reader, "RDB$FIELD_SUB_TYPE");
@@ -543,8 +661,20 @@ namespace DbMetaTool
                         int? charLen = GetNullableInt32(reader, "RDB$CHARACTER_LENGTH");
                         string charSet = GetNullableString(reader, "RDB$CHARACTER_SET_NAME");
 
-                        string typeDef = GetSqlType(fieldType, fieldSubType, fieldScale, fieldPrec, charLen, charSet);
+                        string typeDef;
+                        if (domainNames.Contains(fieldSrc))
+                        {
+                            // parametr oparty na domenie – użyj nazwy domeny
+                            typeDef = fieldSrc;
+                        }
+                        else
+                        {
+                            // w przeciwnym razie generuj typ jak dotąd
+                            typeDef = GetSqlType(fieldType, fieldSubType, fieldScale, fieldPrec, charLen, charSet);
+                        }
+
                         string def = $"{name} {typeDef}";
+
 
                         if (paramType == 0)
                             inputs.Add(def);
@@ -638,6 +768,59 @@ namespace DbMetaTool
             // awaryjnie
             return "BLOB";
         }
+
+        private static bool CanIgnoreUpdateError(string sql, FbException ex)
+        {
+            // -607 = „unsuccessful metadata update”
+            if (ex.ErrorCode != -607)
+                return false;
+
+            var msg = ex.Message ?? string.Empty;
+            msg = msg.ToUpperInvariant();
+
+            if (msg.Contains("ALREADY EXISTS"))
+            {
+                // typowy przypadek:
+                // „CREATE TABLE ... failed; Table ... already exists”
+                // „CREATE DOMAIN ... failed; Domain ... already exists”
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetCreatedDomainName(string sql, out string domainName)
+        {
+            domainName = string.Empty;
+
+            var trimmed = sql.TrimStart();
+            var tokens = trimmed
+                .Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+            if (tokens.Length < 3)
+                return false;
+
+            if (!tokens[0].Equals("CREATE", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!tokens[1].Equals("DOMAIN", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            domainName = tokens[2].Trim('"');
+            return true;
+        }
+
+        private static bool DomainExists(FbConnection connection, string domainName)
+        {
+            const string sql = "SELECT 1 FROM RDB$FIELDS WHERE TRIM(RDB$FIELD_NAME) = @NAME";
+
+            using var cmd = new FbCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@NAME", domainName);
+
+            using var reader = cmd.ExecuteReader();
+            return reader.Read();
+        }
+
 
         #endregion
     }
