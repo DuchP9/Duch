@@ -1,25 +1,24 @@
 # Duch
 
-Test Sente
 
-Z powodu u¿ywania na codzieñ bazy Firebird 2.5 (x32) mia³em problem z konfiguracj¹ wersji Firebird 5.0.
+Z powodu uÅ¼ywania na codzieÅ„ bazy Firebird 2.5 (x32) miaÅ‚em problem z konfiguracjÄ… wersji Firebird 5.0.
 Aplikacja jest budowana do wersji x32 bit (ograniczenie narzucone przez IBExpert)
 
-Uda³o siê wykonaæ zadanie na wersji Firebird 5.0 x32, ale do bazy ³¹czê siê lokalnie (bez uzycia serwera "remote" i localhosta)
+UdaÅ‚o siÄ™ wykonaÄ‡ zadanie na wersji Firebird 5.0 x32, ale do bazy Å‚Ä…czÄ™ siÄ™ lokalnie (bez uzycia serwera "remote" i localhosta)
 
-komendy których u¿ywa³em do wywo³ania programu (nie zmieniam œcie¿ek):
+komendy ktÃ³rych uÅ¼ywaÅ‚em do wywoÅ‚ania programu (nie zmieniam Å›cieÅ¼ek):
 
-1. eksport skryptów z bazy:
+1. eksport skryptÃ³w z bazy:
    dotnet run -- export-scripts --connection-string "Database=C:\_BAZY\DUCH.FDB;User=SYSDBA;Password=masterkey;Dialect=3;Charset=UTF8;ServerType=1;ClientLibrary=C:\Program Files (x86)\Firebird\Firebird_5_0_32\fbclient.dll;" --output-dir "C:\_meta\scripts"
 
-2. za³o¿enie bazy ze skryptów:
+2. zaÅ‚oÅ¼enie bazy ze skryptÃ³w:
    dotnet run -- build-db --db-dir "C:\_BAZY\DUCH_kopia.fdb" --scripts-dir "C:\_meta\scripts"
 
-3. aktualizacja bazy ze skryptów:
+3. aktualizacja bazy ze skryptÃ³w:
    dotnet run -- update-db --connection-string "Database=C:\_BAZY\DUCH.FDB;User=SYSDBA;Password=masterkey;Dialect=3;Charset=UTF8;ServerType=1;ClientLibrary=C:\Program Files (x86)\Firebird\Firebird_5_0_32\fbclient.dll;" --scripts-dir "C:\_meta\scripts"
 
-Punkt 3. (update) mo¿e byæ realizowany z u¿yciem skryptów wygenerowanych w punkcie 1. tylko w przypadku procedur ze wzglêdu na sk³adniê (CREATE OR ALTER PROCEDURE.......), natomiast skrypty do aktualizacji tabel i domen trzeba dostosowaæ (sk³adnia skryptów CREATE TABLE....... i CREATE DOMAIN...........).
-Nie do koñca zrozumia³em czy aktualizacja musi odbywaæ siê równie¿ z u¿yciem tych skryptów które wygenerowa³em, wiêc zostawiam to w tej formie. Jeœli zamienimy rêcznie skrypt na "ALTER TABLE" lub "ALTER DOMAIN" to powinno zadzia³aæ.
+Punkt 3. (update) moÅ¼e byÄ‡ realizowany z uÅ¼yciem skryptÃ³w wygenerowanych w punkcie 1. tylko w przypadku procedur ze wzglÄ™du na skÅ‚adniÄ™ (CREATE OR ALTER PROCEDURE.......), natomiast skrypty do aktualizacji tabel i domen trzeba dostosowaÄ‡ (skÅ‚adnia skryptÃ³w CREATE TABLE....... i CREATE DOMAIN...........).
+Nie do koÅ„ca zrozumiaÅ‚em czy aktualizacja musi odbywaÄ‡ siÄ™ rÃ³wnieÅ¼ z uÅ¼yciem tych skryptÃ³w ktÃ³re wygenerowaÅ‚em, wiÄ™c zostawiam to w tej formie. JeÅ›li zamienimy rÄ™cznie skrypt na "ALTER TABLE" lub "ALTER DOMAIN" to powinno zadziaÅ‚aÄ‡.
 
 W folderze \_BAZY jest baza oryginalna oraz skopiowana.
-W folderze scripts s¹ skrypty wygenerowane z mojej bazy.
+W folderze scripts sÄ… skrypty wygenerowane z mojej bazy.
