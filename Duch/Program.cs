@@ -6,15 +6,16 @@ using System.Text;
 using System.Collections.Generic;
 using System.Linq;
 using System.Data.Common;
+using System.IO; // dla StringReader
 
 namespace DbMetaTool
 {
     public static class Program
     {
         // Przykładowe wywołania:
-        // DbMetaTool build-db --db-dir "C:\db\fb5" --scripts-dir "C:\scripts"
-        // DbMetaTool export-scripts --connection-string "..." --output-dir "C:\out"
-        // DbMetaTool update-db --connection-string "..." --scripts-dir "C:\scripts"
+        // DbMetaTool build-db --db-dir "C:\\db\\fb5" --scripts-dir "C:\\scripts"
+        // DbMetaTool export-scripts --connection-string "..." --output-dir "C:\\out"
+        // DbMetaTool update-db --connection-string "..." --scripts-dir "C:\\scripts"
         #region Entry point and commands
         public static int Main(string[] args)
         {
@@ -88,12 +89,6 @@ namespace DbMetaTool
         /// </summary>
         public static void BuildDatabase(string databaseDirectory, string scriptsDirectory)
         {
-            // TODO:
-            // 1) Utwórz pustą bazę danych FB 5.0 w katalogu databaseDirectory.
-            // 2) Wczytaj i wykonaj kolejno skrypty z katalogu scriptsDirectory
-            //    (tylko domeny, tabele, procedury).
-            // 3) Obsłuż błędy i wyświetl raport.
-            //throw new NotImplementedException();
             if (string.IsNullOrWhiteSpace(databaseDirectory))
                 throw new ArgumentException("Parametr databaseDirectory jest wymagany.", nameof(databaseDirectory));
 
@@ -164,7 +159,6 @@ namespace DbMetaTool
                     try
                     {
                         var script = new FbScript(scriptText);
-
                         script.Parse();
 
                         var batch = new FbBatchExecution(connection);
@@ -178,7 +172,6 @@ namespace DbMetaTool
                 }
             }
 
-            // 5) Raport z wykonania
             if (errors.Count > 0)
             {
                 Console.WriteLine("Błędy podczas budowania bazy danych:");
@@ -187,10 +180,8 @@ namespace DbMetaTool
                     Console.WriteLine("  - " + err);
                 }
 
-                // sygnalizujemy błąd do Main(), żeby nie wypisał komunikatu o sukcesie
                 throw new InvalidOperationException("Budowanie bazy zakończone z błędami. Szczegóły powyżej.");
             }
-
         }
 
         /// <summary>
@@ -198,10 +189,6 @@ namespace DbMetaTool
         /// </summary>
         public static void ExportScripts(string connectionString, string outputDirectory)
         {
-            // TODO:
-            // 1) Połącz się z bazą danych przy użyciu connectionString.
-            // 2) Pobierz metadane domen, tabel (z kolumnami) i procedur.
-            // 3) Wygeneruj pliki .sql / .json / .txt w outputDirectory.
             if (string.IsNullOrWhiteSpace(connectionString))
                 throw new ArgumentException("Parametr connectionString jest wymagany.", nameof(connectionString));
 
@@ -231,10 +218,6 @@ namespace DbMetaTool
         /// </summary>
         public static void UpdateDatabase(string connectionString, string scriptsDirectory)
         {
-            // TODO:
-            // 1) Połącz się z bazą danych przy użyciu connectionString.
-            // 2) Wykonaj skrypty z katalogu scriptsDirectory (tylko obsługiwane elementy).
-            // 3) Zadbaj o poprawną kolejność i bezpieczeństwo zmian.
             if (string.IsNullOrWhiteSpace(connectionString))
                 throw new ArgumentException("Parametr connectionString jest wymagany.", nameof(connectionString));
 
@@ -244,29 +227,159 @@ namespace DbMetaTool
             if (!Directory.Exists(scriptsDirectory))
                 throw new DirectoryNotFoundException($"Katalog ze skryptami nie istnieje: {scriptsDirectory}");
 
-            var sqlFiles = Directory
-                .EnumerateFiles(scriptsDirectory, "*.sql")
-                .OrderBy(Path.GetFileName) // np. 01_domains.sql, 02_tables.sql, 03_procedures.sql
-                .ToList();
-
-            if (sqlFiles.Count == 0)
-                throw new InvalidOperationException($"W katalogu {scriptsDirectory} nie znaleziono żadnych plików .sql.");
-
             var errors = new List<string>();
+
+            // zakładamy standardowe nazwy plików, bo sam je tak generujesz
+            string domainsPath = Path.Combine(scriptsDirectory, "01_domains.sql");
+            string tablesPath = Path.Combine(scriptsDirectory, "02_tables.sql");
+            string proceduresPath = Path.Combine(scriptsDirectory, "03_procedures.sql");
+
+            string domainsScriptText = File.Exists(domainsPath) ? File.ReadAllText(domainsPath) : string.Empty;
+            string tablesScriptText = File.Exists(tablesPath) ? File.ReadAllText(tablesPath) : string.Empty;
+            string proceduresScriptText = File.Exists(proceduresPath) ? File.ReadAllText(proceduresPath) : string.Empty;
+
+            // skrypty jako "źródło prawdy"
+            var scriptDomains = ParseDomainCreateStatements(domainsScriptText);   // nazwa -> CREATE DOMAIN ...
+            var scriptTables = ParseTableScripts(tablesScriptText);               // nazwa -> TableScriptInfo (CREATE TABLE + kolumny)
 
             using (var connection = new FbConnection(connectionString))
             {
                 connection.Open();
 
-                foreach (var file in sqlFiles)
-                {
-                    var scriptText = File.ReadAllText(file);
-                    if (string.IsNullOrWhiteSpace(scriptText))
-                        continue;
+                // ===== KROK 0: Zaczytaj stan bazy =====
+                var dbDomainNames = GetUserDomainNames(connection);
+                var dbTableNames = GetUserTableNames(connection);
 
+                // ===== KROK 1: Domeny – UPEWNIJ SIĘ, że wszystkie ze skryptu istnieją =====
+                // (żeby CREATE TABLE miał do czego się odwołać)
+                foreach (var kvp in scriptDomains)
+                {
+                    var domName = kvp.Key;
+                    if (!dbDomainNames.Contains(domName))
+                    {
+                        try
+                        {
+                            using var cmd = new FbCommand(kvp.Value, connection);
+                            cmd.ExecuteNonQuery();
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add($"CREATE DOMAIN {domName}: {ex.Message}");
+                        }
+                    }
+                }
+
+                // odśwież listę domen po ewentualnym dodaniu
+                dbDomainNames = GetUserDomainNames(connection);
+
+                // ===== KROK 2: Procedury – najpierw stuby, potem DROP, potem FK =====
+                // 2a) Zneutralizuj wszystkie procedury (ALTER ... AS BEGIN END),
+                //     żeby straciły zależności od tabel / innych procedur.
+                NeutralizeAllUserProcedures(connection, dbDomainNames);
+
+                // 2b) Teraz można bezpiecznie je dropnąć (nie ma już zależności cyklicznych)
+                DropAllUserProcedures(connection);
+
+                // 2c) Dla porządku – jeśli są jakieś FK, też je zdejmujemy
+                DropAllForeignKeys(connection);
+
+
+                // ===== KROK 3: Tabele – diff po nazwach + porównanie kolumn =====
+
+                // 3.1 Nadmiarowe tabele – kasujemy (są w bazie, nie ma ich w skryptach)
+                dbTableNames = GetUserTableNames(connection); // świeża lista po ewentualnym DROP PROCEDURE
+                foreach (var dbTable in dbTableNames)
+                {
+                    if (!scriptTables.ContainsKey(dbTable))
+                    {
+                        try
+                        {
+                            using var drop = new FbCommand($"DROP TABLE {dbTable}", connection);
+                            drop.ExecuteNonQuery();
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add($"DROP TABLE {dbTable}: {ex.Message}");
+                        }
+                    }
+                }
+
+                // 3.2 Po dropie nadmiarowych – odśwież listę tabel
+                dbTableNames = GetUserTableNames(connection);
+
+                // 3.3 Dla każdej tabeli ze skryptu:
+                //  - jeśli brak w bazie -> CREATE TABLE
+                //  - jeśli istnieje -> porównaj definicje kolumn; jeśli różne -> DROP + CREATE
+                foreach (var kvp in scriptTables)
+                {
+                    var tableName = kvp.Key;
+                    var tableInfo = kvp.Value;
+
+                    if (!dbTableNames.Contains(tableName))
+                    {
+                        // brakująca tabela – tworzymy
+                        try
+                        {
+                            using var cmd = new FbCommand(tableInfo.CreateStatement, connection);
+                            cmd.ExecuteNonQuery();
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add($"CREATE TABLE {tableName}: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        // istniejąca – porównaj definicje kolumn
+                        bool differs = TableDefinitionDiffers(connection, tableName, dbDomainNames, tableInfo);
+                        if (differs)
+                        {
+                            try
+                            {
+                                using (var drop = new FbCommand($"DROP TABLE {tableName}", connection))
+                                {
+                                    drop.ExecuteNonQuery();
+                                }
+
+                                using (var create = new FbCommand(tableInfo.CreateStatement, connection))
+                                {
+                                    create.ExecuteNonQuery();
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                errors.Add($"Recreate TABLE {tableName}: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+
+                // ===== KROK 4: Domeny – teraz możemy usunąć NADMIAROWE =====
+                // (po wyrównaniu tabel finalny schemat nie powinien już ich używać)
+                dbDomainNames = GetUserDomainNames(connection); // odśwież
+                foreach (var dbDom in dbDomainNames)
+                {
+                    if (!scriptDomains.ContainsKey(dbDom))
+                    {
+                        try
+                        {
+                            using var drop = new FbCommand($"DROP DOMAIN {dbDom}", connection);
+                            drop.ExecuteNonQuery();
+                        }
+                        catch (Exception ex)
+                        {
+                            // jeśli nadal coś ją trzyma, to jest realny problem – raportujemy
+                            errors.Add($"DROP DOMAIN {dbDom}: {ex.Message}");
+                        }
+                    }
+                }
+
+                // ===== KROK 5: Procedury – wgrywamy pełny skrypt 03_procedures.sql =====
+                if (!string.IsNullOrWhiteSpace(proceduresScriptText))
+                {
                     try
                     {
-                        var script = new FbScript(scriptText);
+                        var script = new FbScript(proceduresScriptText);
                         script.UnknownStatement += (sender, e) =>
                         {
                             e.NewStatementType = SqlStatementType.Update;
@@ -284,33 +397,20 @@ namespace DbMetaTool
                             if (string.IsNullOrWhiteSpace(sql))
                                 continue;
 
-                            // 1) jeśli to CREATE DOMAIN i domena już istnieje – pomijamy
-                            if (TryGetCreatedDomainName(sql, out var domainName) &&
-                                DomainExists(connection, domainName))
+                            try
                             {
-                                continue;
+                                using var cmd = new FbCommand(sql, connection);
+                                cmd.ExecuteNonQuery();
                             }
-
-                            using (var cmd = new FbCommand(sql, connection))
+                            catch (FbException ex)
                             {
-                                try
-                                {
-                                    cmd.ExecuteNonQuery();
-                                }
-                                catch (FbException ex)
-                                {
-                                    if (CanIgnoreUpdateError(sql, ex))
-                                        continue;
-
-                                    errors.Add($"Plik '{Path.GetFileName(file)}': {ex.Message}");
-                                }
+                                errors.Add($"Plik '03_procedures.sql': {ex.Message}");
                             }
                         }
-
                     }
                     catch (Exception ex)
                     {
-                        errors.Add($"Plik '{Path.GetFileName(file)}': {ex.Message}");
+                        errors.Add($"Plik '03_procedures.sql': {ex.Message}");
                     }
                 }
             }
@@ -326,6 +426,8 @@ namespace DbMetaTool
                 throw new InvalidOperationException("Aktualizacja bazy zakończona z błędami. Szczegóły powyżej.");
             }
         }
+
+
         #endregion
 
         #region Export helpers
@@ -511,11 +613,10 @@ namespace DbMetaTool
 
             return result;
         }
-        
+
         private static string GenerateProceduresSql(FbConnection connection, HashSet<string> domainNames)
         {
-            var sb = new StringBuilder();
-            bool hasAny = false;
+            var procedures = new List<ProcedureMetadata>();
 
             const string sql = @"
         SELECT
@@ -530,51 +631,12 @@ namespace DbMetaTool
             {
                 while (reader.Read())
                 {
-                    if (!hasAny)
-                    {
-                        // ustawiamy niestandardowy terminator dla procedur
-                        sb.AppendLine("SET TERM ^ ;");
-                        hasAny = true;
-                    }
-
                     var procName = reader.GetString(reader.GetOrdinal("PROCEDURE_NAME")).Trim();
                     string body = GetNullableString(reader, "SOURCE") ?? string.Empty;
 
                     var inputs = new List<string>();
                     var outputs = new List<string>();
                     LoadProcedureParameters(connection, procName, domainNames, inputs, outputs);
-
-                    sb.Append("CREATE OR ALTER PROCEDURE ").Append(procName);
-
-                    if (inputs.Count > 0)
-                    {
-                        sb.AppendLine().AppendLine("(");
-                        for (int i = 0; i < inputs.Count; i++)
-                        {
-                            sb.Append("    ").Append(inputs[i]);
-                            if (i < inputs.Count - 1)
-                                sb.Append(',');
-                            sb.AppendLine();
-                        }
-                        sb.AppendLine(")");
-                    }
-                    else
-                    {
-                        sb.AppendLine();
-                    }
-
-                    if (outputs.Count > 0)
-                    {
-                        sb.AppendLine("RETURNS (");
-                        for (int i = 0; i < outputs.Count; i++)
-                        {
-                            sb.Append("    ").Append(outputs[i]);
-                            if (i < outputs.Count - 1)
-                                sb.Append(',');
-                            sb.AppendLine();
-                        }
-                        sb.AppendLine(")");
-                    }
 
                     var trimmedBody = body.Trim();
                     string bodyToEmit;
@@ -588,7 +650,6 @@ namespace DbMetaTool
                         var noLeading = trimmedBody.TrimStart();
                         if (!noLeading.StartsWith("AS", StringComparison.OrdinalIgnoreCase))
                         {
-                            // w RDB$PROCEDURE_SOURCE zwykle jest samo BEGIN...END
                             bodyToEmit = "AS\n" + trimmedBody;
                         }
                         else
@@ -597,24 +658,42 @@ namespace DbMetaTool
                         }
                     }
 
-                    // ciało procedury
-                    sb.AppendLine(bodyToEmit.TrimEnd());
+                    var meta = new ProcedureMetadata
+                    {
+                        Name = procName,
+                        Body = bodyToEmit
+                    };
+                    meta.Inputs.AddRange(inputs);
+                    meta.Outputs.AddRange(outputs);
 
-                    // terminator procedury – używamy '^'
-                    sb.AppendLine("^");
-                    sb.AppendLine();
+                    procedures.Add(meta);
                 }
             }
 
-            if (hasAny)
+            if (procedures.Count == 0)
+                return string.Empty;
+
+            var sb = new StringBuilder();
+
+            sb.AppendLine("SET TERM ^ ;");
+            sb.AppendLine();
+
+            sb.AppendLine("-- === Stub definitions ===");
+            foreach (var proc in procedures)
             {
-                // przywracamy standardowy terminator ';'
-                sb.AppendLine("SET TERM ; ^");
+                AppendProcedureDefinition(sb, "CREATE OR ALTER PROCEDURE", proc, isStub: true);
             }
+
+            sb.AppendLine("-- === Full bodies ===");
+            foreach (var proc in procedures)
+            {
+                AppendProcedureDefinition(sb, "ALTER PROCEDURE", proc, isStub: false);
+            }
+
+            sb.AppendLine("SET TERM ; ^");
 
             return sb.ToString();
         }
-
 
         private static void LoadProcedureParameters(
             FbConnection connection,
@@ -635,7 +714,8 @@ namespace DbMetaTool
     f.RDB$FIELD_PRECISION,
     f.RDB$FIELD_SCALE,
     f.RDB$CHARACTER_LENGTH,
-    cs.RDB$CHARACTER_SET_NAME
+    cs.RDB$CHARACTER_SET_NAME,
+    pp.RDB$DEFAULT_SOURCE       AS DEFAULT_SOURCE
         FROM RDB$PROCEDURE_PARAMETERS pp
         JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = pp.RDB$FIELD_SOURCE
         LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
@@ -664,17 +744,22 @@ namespace DbMetaTool
                         string typeDef;
                         if (domainNames.Contains(fieldSrc))
                         {
-                            // parametr oparty na domenie – użyj nazwy domeny
                             typeDef = fieldSrc;
                         }
                         else
                         {
-                            // w przeciwnym razie generuj typ jak dotąd
                             typeDef = GetSqlType(fieldType, fieldSubType, fieldScale, fieldPrec, charLen, charSet);
                         }
 
+                        string defaultSource = GetNullableString(reader, "DEFAULT_SOURCE");
+
                         string def = $"{name} {typeDef}";
 
+                        if (!string.IsNullOrWhiteSpace(defaultSource))
+                        {
+                            var defExpr = defaultSource.Trim();
+                            def += " " + defExpr;
+                        }
 
                         if (paramType == 0)
                             inputs.Add(def);
@@ -684,7 +769,79 @@ namespace DbMetaTool
                 }
             }
         }
+
+        private static void AppendProcedureDefinition(
+            StringBuilder sb,
+            string keyword,              // "CREATE OR ALTER PROCEDURE" albo "ALTER PROCEDURE"
+            ProcedureMetadata proc,
+            bool isStub)
+        {
+            sb.Append(keyword).Append(' ').Append(proc.Name);
+
+            // parametry wejściowe
+            if (proc.Inputs.Count > 0)
+            {
+                sb.AppendLine()
+                  .AppendLine("(");
+                for (int i = 0; i < proc.Inputs.Count; i++)
+                {
+                    sb.Append("    ").Append(proc.Inputs[i]);
+                    if (i < proc.Inputs.Count - 1)
+                        sb.Append(',');
+                    sb.AppendLine();
+                }
+                sb.AppendLine(")");
+            }
+            else
+            {
+                sb.AppendLine();
+            }
+
+            // parametry wyjściowe
+            if (proc.Outputs.Count > 0)
+            {
+                sb.AppendLine("RETURNS (");
+                for (int i = 0; i < proc.Outputs.Count; i++)
+                {
+                    sb.Append("    ").Append(proc.Outputs[i]);
+                    if (i < proc.Outputs.Count - 1)
+                        sb.Append(',');
+                    sb.AppendLine();
+                }
+                sb.AppendLine(")");
+            }
+
+            if (isStub)
+            {
+                sb.AppendLine("AS");
+                sb.AppendLine("BEGIN");
+                sb.AppendLine("END");
+                sb.AppendLine("^");
+                sb.AppendLine();
+            }
+            else
+            {
+                sb.AppendLine(proc.Body.TrimEnd());
+                sb.AppendLine("^");
+                sb.AppendLine();
+            }
+        }
         #endregion
+
+        private sealed class ProcedureMetadata
+        {
+            public string Name { get; set; } = string.Empty;
+            public string Body { get; set; } = string.Empty;
+            public List<string> Inputs { get; } = new List<string>();
+            public List<string> Outputs { get; } = new List<string>();
+        }
+
+        private sealed class TableScriptInfo
+        {
+            public string Name { get; set; } = string.Empty;
+            public string CreateStatement { get; set; } = string.Empty;
+            public List<string> Columns { get; } = new List<string>();
+        }
 
         #region Utils
         private static short? GetNullableInt16(FbDataReader reader, string columnName)
@@ -713,7 +870,6 @@ namespace DbMetaTool
             int? charLen,
             string? charSet)
         {
-            // bardzo uproszczone mapowanie wystarczające do typowych domen/tabel
             switch (fieldType)
             {
                 case 7:   // SMALLINT / NUMERIC/DECIMAL
@@ -765,61 +921,439 @@ namespace DbMetaTool
                     return "BLOB";
             }
 
-            // awaryjnie
             return "BLOB";
         }
 
-        private static bool CanIgnoreUpdateError(string sql, FbException ex)
+        // ======== NOWE / ZMIENIONE HELPERY DLA DIFF-A ========
+
+        private static Dictionary<string, string> ParseDomainCreateStatements(string scriptText)
         {
-            // -607 = „unsuccessful metadata update”
-            if (ex.ErrorCode != -607)
-                return false;
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            var msg = ex.Message ?? string.Empty;
-            msg = msg.ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(scriptText))
+                return result;
 
-            if (msg.Contains("ALREADY EXISTS"))
+            var parts = scriptText.Split(';');
+            foreach (var raw in parts)
             {
-                // typowy przypadek:
-                // „CREATE TABLE ... failed; Table ... already exists”
-                // „CREATE DOMAIN ... failed; Domain ... already exists”
+                var part = raw.Trim();
+                if (part.Length == 0)
+                    continue;
+
+                if (!part.StartsWith("CREATE DOMAIN", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var tokens = part
+                    .Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+                if (tokens.Length < 3)
+                    continue;
+
+                var name = tokens[2].Trim('"');
+                var stmt = part.TrimEnd() + ";";
+                result[name] = stmt;
+            }
+
+            return result;
+        }
+
+        private static Dictionary<string, TableScriptInfo> ParseTableScripts(string scriptText)
+        {
+            var result = new Dictionary<string, TableScriptInfo>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(scriptText))
+                return result;
+
+            using var reader = new StringReader(scriptText);
+            string? line;
+            StringBuilder? currentStmt = null;
+            TableScriptInfo? currentTable = null;
+
+            while ((line = reader.ReadLine()) != null)
+            {
+                var trimmed = line.TrimStart();
+
+                if (trimmed.StartsWith("CREATE TABLE", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentStmt = new StringBuilder();
+                    currentStmt.AppendLine(line);
+
+                    var tokens = trimmed
+                        .Split(new[] { ' ', '\t', '(' }, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (tokens.Length >= 3)
+                    {
+                        var tableName = tokens[2].Trim('"');
+                        currentTable = new TableScriptInfo { Name = tableName };
+                    }
+                    else
+                    {
+                        currentTable = null;
+                    }
+
+                    continue;
+                }
+
+                if (currentStmt != null)
+                {
+                    currentStmt.AppendLine(line);
+
+                    if (trimmed.StartsWith(");", StringComparison.Ordinal))
+                    {
+                        if (currentTable != null)
+                        {
+                            currentTable.CreateStatement = currentStmt.ToString();
+                            ExtractColumnsFromCreateTable(currentTable);
+                            result[currentTable.Name] = currentTable;
+                        }
+
+                        currentStmt = null;
+                        currentTable = null;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static void ExtractColumnsFromCreateTable(TableScriptInfo table)
+        {
+            var text = table.CreateStatement;
+            int start = text.IndexOf('(');
+            int end = text.LastIndexOf(");", StringComparison.Ordinal);
+
+            if (start < 0 || end <= start)
+                return;
+
+            var inner = text.Substring(start + 1, end - start - 1);
+
+            using var reader = new StringReader(inner);
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                var trimmed = line.Trim();
+                if (string.IsNullOrEmpty(trimmed))
+                    continue;
+
+                if (trimmed.EndsWith(","))
+                    trimmed = trimmed.Substring(0, trimmed.Length - 1).TrimEnd();
+
+                if (trimmed.Length == 0)
+                    continue;
+
+                // zakładamy, że tu są tylko definicje kolumn – tak generuje je GenerateTablesSql
+                table.Columns.Add(trimmed);
+            }
+        }
+
+        private static HashSet<string> ParseProcedureNames(string scriptText)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(scriptText))
+                return result;
+
+            using var reader = new StringReader(scriptText);
+            string? line;
+
+            while ((line = reader.ReadLine()) != null)
+            {
+                var trimmed = line.TrimStart();
+                if (trimmed.Length == 0)
+                    continue;
+
+                var tokens = trimmed
+                    .Split(new[] { ' ', '\t', '(', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+                if (tokens.Length == 0)
+                    continue;
+
+                if (tokens[0].Equals("CREATE", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (tokens.Length >= 3 &&
+                        tokens[1].Equals("PROCEDURE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(tokens[2].Trim('"'));
+                    }
+                    else if (tokens.Length >= 5 &&
+                             tokens[1].Equals("OR", StringComparison.OrdinalIgnoreCase) &&
+                             tokens[2].Equals("ALTER", StringComparison.OrdinalIgnoreCase) &&
+                             tokens[3].Equals("PROCEDURE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(tokens[4].Trim('"'));
+                    }
+                }
+                else if (tokens[0].Equals("ALTER", StringComparison.OrdinalIgnoreCase) &&
+                         tokens.Length >= 3 &&
+                         tokens[1].Equals("PROCEDURE", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(tokens[2].Trim('"'));
+                }
+            }
+
+            return result;
+        }
+
+
+        private static bool TableDefinitionDiffers(
+            FbConnection connection,
+            string tableName,
+            HashSet<string> dbDomainNames,
+            TableScriptInfo scriptInfo)
+        {
+            var dbColumns = GetColumnsForTable(connection, tableName, dbDomainNames);
+            var scriptColumns = scriptInfo.Columns;
+
+            if (dbColumns.Count != scriptColumns.Count)
                 return true;
+
+            for (int i = 0; i < dbColumns.Count; i++)
+            {
+                var dbCol = dbColumns[i].Trim();
+                var scriptCol = scriptColumns[i].Trim();
+
+                if (!string.Equals(dbCol, scriptCol, StringComparison.OrdinalIgnoreCase))
+                    return true;
             }
 
             return false;
         }
 
-        private static bool TryGetCreatedDomainName(string sql, out string domainName)
+        private static HashSet<string> GetUserDomainNames(FbConnection connection)
         {
-            domainName = string.Empty;
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            var trimmed = sql.TrimStart();
-            var tokens = trimmed
-                .Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-
-            if (tokens.Length < 3)
-                return false;
-
-            if (!tokens[0].Equals("CREATE", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            if (!tokens[1].Equals("DOMAIN", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            domainName = tokens[2].Trim('"');
-            return true;
-        }
-
-        private static bool DomainExists(FbConnection connection, string domainName)
-        {
-            const string sql = "SELECT 1 FROM RDB$FIELDS WHERE TRIM(RDB$FIELD_NAME) = @NAME";
+            const string sql = @"
+        SELECT TRIM(f.RDB$FIELD_NAME) AS DOMAIN_NAME
+        FROM RDB$FIELDS f
+        WHERE (f.RDB$SYSTEM_FLAG IS NULL OR f.RDB$SYSTEM_FLAG = 0)
+          AND f.RDB$FIELD_NAME NOT LIKE 'RDB$%'";
 
             using var cmd = new FbCommand(sql, connection);
-            cmd.Parameters.AddWithValue("@NAME", domainName);
-
             using var reader = cmd.ExecuteReader();
-            return reader.Read();
+            while (reader.Read())
+            {
+                var name = reader.GetString(reader.GetOrdinal("DOMAIN_NAME")).Trim();
+                if (!string.IsNullOrEmpty(name))
+                    result.Add(name);
+            }
+
+            return result;
         }
+
+        private static HashSet<string> GetUserTableNames(FbConnection connection)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            const string sql = @"
+        SELECT TRIM(r.RDB$RELATION_NAME) AS TABLE_NAME
+        FROM RDB$RELATIONS r
+        WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+          AND r.RDB$VIEW_BLR IS NULL";
+
+            using var cmd = new FbCommand(sql, connection);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var name = reader.GetString(reader.GetOrdinal("TABLE_NAME")).Trim();
+                if (!string.IsNullOrEmpty(name))
+                    result.Add(name);
+            }
+
+            return result;
+        }
+
+        private static HashSet<string> GetUserProcedureNames(FbConnection connection)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            const string sql = @"
+        SELECT TRIM(p.RDB$PROCEDURE_NAME) AS PROC_NAME
+        FROM RDB$PROCEDURES p
+        WHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0";
+
+            using var cmd = new FbCommand(sql, connection);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var name = reader.GetString(reader.GetOrdinal("PROC_NAME")).Trim();
+                if (!string.IsNullOrEmpty(name))
+                    result.Add(name);
+            }
+
+            return result;
+        }
+
+        private static void DropAllUserProcedures(FbConnection connection)
+        {
+            const string sql = @"
+        SELECT TRIM(p.RDB$PROCEDURE_NAME) AS PROC_NAME
+        FROM RDB$PROCEDURES p
+        WHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0";
+
+            var names = new List<string>();
+
+            using (var cmd = new FbCommand(sql, connection))
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var name = reader.GetString(reader.GetOrdinal("PROC_NAME")).Trim();
+                    if (!string.IsNullOrEmpty(name))
+                        names.Add(name);
+                }
+            }
+
+            foreach (var name in names)
+            {
+                using var drop = new FbCommand($"DROP PROCEDURE {name}", connection);
+                try
+                {
+                    drop.ExecuteNonQuery();
+                }
+                catch
+                {
+                    // Ignorujemy ewentualne błędy pojedynczych procedur.
+                    // I tak później odtworzymy komplet procedur ze skryptu 03_procedures.sql.
+                }
+            }
+        }
+
+        private static void DropAllForeignKeys(FbConnection connection)
+        {
+            const string sql = @"
+        SELECT
+            TRIM(rc.RDB$CONSTRAINT_NAME) AS CNAME,
+            TRIM(rc.RDB$RELATION_NAME)   AS TNAME
+        FROM RDB$RELATION_CONSTRAINTS rc
+        WHERE rc.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'";
+
+            var items = new List<(string Table, string Constraint)>();
+
+            using (var cmd = new FbCommand(sql, connection))
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var cname = reader.GetString(reader.GetOrdinal("CNAME")).Trim();
+                    var tname = reader.GetString(reader.GetOrdinal("TNAME")).Trim();
+
+                    if (!string.IsNullOrEmpty(cname) && !string.IsNullOrEmpty(tname))
+                    {
+                        items.Add((tname, cname));
+                    }
+                }
+            }
+
+            foreach (var (table, constraint) in items)
+            {
+                var dropSql = $"ALTER TABLE {table} DROP CONSTRAINT {constraint}";
+                using var dropCmd = new FbCommand(dropSql, connection);
+                try
+                {
+                    dropCmd.ExecuteNonQuery();
+                }
+                catch
+                {
+                    // Ignorujemy pojedyncze błędy, bo i tak robimy pełny diff
+                    // i finalnie struktura ma być zgodna ze skryptami.
+                }
+            }
+        }
+
+        private static void NeutralizeAllUserProcedures(FbConnection connection, HashSet<string> domainNames)
+        {
+            // 1) Pobierz listę wszystkich procedur użytkownika
+            var procedures = new List<ProcedureMetadata>();
+
+            const string sql = @"
+        SELECT TRIM(p.RDB$PROCEDURE_NAME) AS PROCEDURE_NAME
+        FROM RDB$PROCEDURES p
+        WHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0";
+
+            using (var cmd = new FbCommand(sql, connection))
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var name = reader.GetString(reader.GetOrdinal("PROCEDURE_NAME")).Trim();
+                    if (string.IsNullOrEmpty(name))
+                        continue;
+
+                    var meta = new ProcedureMetadata { Name = name };
+
+                    // używamy istniejącego helpera do wyciągnięcia parametrów
+                    var inputs = new List<string>();
+                    var outputs = new List<string>();
+                    LoadProcedureParameters(connection, name, domainNames, inputs, outputs);
+
+                    meta.Inputs.AddRange(inputs);
+                    meta.Outputs.AddRange(outputs);
+
+                    procedures.Add(meta);
+                }
+            }
+
+            // 2) Dla każdej procedury generujemy ALTER ... z pustym ciałem
+            foreach (var proc in procedures)
+            {
+                var sb = new StringBuilder();
+                sb.Append("ALTER PROCEDURE ").Append(proc.Name);
+
+                // parametry wejściowe
+                if (proc.Inputs.Count > 0)
+                {
+                    sb.AppendLine()
+                      .AppendLine("(");
+                    for (int i = 0; i < proc.Inputs.Count; i++)
+                    {
+                        sb.Append("    ").Append(proc.Inputs[i]);
+                        if (i < proc.Inputs.Count - 1)
+                            sb.Append(',');
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine(")");
+                }
+                else
+                {
+                    sb.AppendLine();
+                }
+
+                // parametry wyjściowe
+                if (proc.Outputs.Count > 0)
+                {
+                    sb.AppendLine("RETURNS (");
+                    for (int i = 0; i < proc.Outputs.Count; i++)
+                    {
+                        sb.Append("    ").Append(proc.Outputs[i]);
+                        if (i < proc.Outputs.Count - 1)
+                            sb.Append(',');
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine(")");
+                }
+
+                sb.AppendLine("AS");
+                sb.AppendLine("BEGIN");
+                sb.AppendLine("END");
+
+                var sqlStub = sb.ToString();
+
+                using var cmdStub = new FbCommand(sqlStub, connection);
+                try
+                {
+                    cmdStub.ExecuteNonQuery();
+                }
+                catch
+                {
+                    // jeśli jakaś pojedyncza procedura się nie „zneutralizuje”,
+                    // trudno – większość zniknie z zależności i i tak odblokuje DROP TABLE.
+                }
+            }
+        }
+
+
+
 
 
         #endregion
